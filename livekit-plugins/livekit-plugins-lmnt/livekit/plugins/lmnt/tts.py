@@ -14,7 +14,10 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 import os
+import weakref
 from dataclasses import dataclass
 from typing import Final
 
@@ -35,10 +38,15 @@ from livekit.agents.types import (
 )
 from livekit.agents.utils import is_given
 
+from .log import logger
 from .models import LMNTAudioFormats, LMNTLanguages, LMNTModels, LMNTSampleRate
 
 LMNT_BASE_URL: Final[str] = "https://api.lmnt.com/v1/ai/speech/bytes"
+LMNT_STREAM_URL: Final[str] = "https://api.lmnt.com/v1/ai/speech/stream"
 NUM_CHANNELS: Final[int] = 1
+
+def ws_url(path: str) -> str:
+    return f"{LMNT_STREAM_URL}{path}"
 
 @dataclass
 class _TTSOptions:
@@ -81,7 +89,7 @@ class TTS(tts.TTS):
             http_session: An existing aiohttp ClientSession to use. If not provided, a new session will be created.
         """
         super().__init__(
-            capabilities=tts.TTSCapabilities(streaming=False),
+            capabilities=tts.TTSCapabilities(streaming=True),
             sample_rate=sample_rate,
             num_channels=NUM_CHANNELS,
         )
@@ -104,6 +112,20 @@ class TTS(tts.TTS):
         )
 
         self._session = http_session
+        self._pool = utils.ConnectionPool[aiohttp.ClientWebSocketResponse](
+            connect_cb=self._connect_ws,
+            close_cb=self._close_ws,
+            max_session_duration=90,
+            mark_refreshed_on_get=True,
+        )
+        self._streams = weakref.WeakSet[SynthesizeStream]()
+
+    async def _connect_ws(self) -> aiohttp.ClientWebSocketResponse:
+        session = self._ensure_session()
+        return await asyncio.wait_for(session.ws_connect(LMNT_STREAM_URL), self._conn_options.timeout)
+
+    async def _close_ws(self, ws: aiohttp.ClientWebSocketResponse):
+        await ws.close()
 
     def synthesize(
             self,
@@ -153,6 +175,22 @@ class TTS(tts.TTS):
 
         return self._session
 
+    def stream(
+        self, *, conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS
+    ) -> SynthesizeStream:
+        stream = SynthesizeStream(
+            tts=self,
+            opts=self._opts,
+            pool=self._pool,
+        )
+        self._streams.add(stream)
+        return stream
+
+    async def aclose(self) -> None:
+        for stream in list(self._streams):
+            await stream.aclose()
+        self._streams.clear()
+        await super().aclose()
 
 
 class ChunkedStream(tts.ChunkedStream):
@@ -224,4 +262,101 @@ class ChunkedStream(tts.ChunkedStream):
         except Exception as e:
             raise APIConnectionError() from e
 
+
+class SynthesizeStream(tts.SynthesizeStream):
+    """Synthesize text to speech in a stream using websockets"""
+
+    def __init__(
+        self,
+        *,
+        tts: TTS,
+        opts: _TTSOptions,
+        pool: utils.ConnectionPool[aiohttp.ClientWebSocketResponse],
+    ) -> None:
+        super().__init__(tts=tts)
+        self._opts, self._pool = opts, pool
+
+    async def _run(self) -> None:
+        request_id = utils.shortuuid()
+
+        async def _input_task(ws: aiohttp.ClientWebSocketResponse):
+            async for text in self._input_ch:
+                if isinstance(text, self._FlushSentinel):
+                    await ws.send_str('{"flush": true}')
+                    continue
+
+                await ws.send_str(json.dumps({"text": text}))
+            await ws.send_str('{"eof": true}')
+
+        async def _recv_task(ws: aiohttp.ClientWebSocketResponse):
+            audio_bstream = utils.audio.AudioByteStream(
+                sample_rate=self._opts.sample_rate,
+                num_channels=NUM_CHANNELS,
+            )
+            emitter = tts.SynthesizedAudioEmitter(
+                event_ch=self._event_ch,
+                request_id=request_id,
+            )
+
+            while True:
+                try:
+                    msg = await ws.receive()
+                except Exception as e:
+                    raise APIStatusError(
+                        "LMNT connection closed unexpectedly",
+                        request_id=request_id,
+                    ) from e
+
+                if msg.type in (
+                    aiohttp.WSMsgType.CLOSED,
+                    aiohttp.WSMsgType.CLOSE,
+                    aiohttp.WSMsgType.CLOSING,
+                ):
+                    break
+                else:
+                    logger.warning("Received LMNT message: %s", msg)
+
+                if msg.type != aiohttp.WSMsgType.TEXT:
+                    logger.warning("Unexpected LMNT message type %s", msg.type)
+                    continue
+
+                data = json.loads(msg.data)
+
+                if data.get("data"):
+                    b64data = base64.b64decode(data["data"])
+                    for frame in audio_bstream.write(b64data):
+                        emitter.push(frame)
+                else:
+                    logger.error("Unexpected LMNT message %s", data)
+
+        async with self._pool.connection() as ws:
+            init_msg = {
+                'X-API-Key': self._opts.api_key,
+                'voice': self._opts.voice,
+                'format': self._opts.format,
+                'language': 'en' if self._opts.language == 'auto' else self._opts.language,
+                'sample_rate': self._opts.sample_rate,
+                'model': self._opts.model,
+            }
+            await ws.send_str(json.dumps(init_msg))
+
+            tasks = [
+                asyncio.create_task(_input_task(ws)),
+                asyncio.create_task(_recv_task(ws)),
+            ]
+            try:
+                await asyncio.gather(*tasks)
+            except asyncio.TimeoutError as e:
+                raise APITimeoutError() from e
+            except aiohttp.ClientResponseError as e:
+                raise APIStatusError(
+                    message=e.message,
+                    status_code=e.status,
+                    request_id=request_id,
+                    body=None,
+                ) from e
+            except Exception as e:
+                raise APIConnectionError() from e
+            finally:
+                await utils.aio.gracefully_cancel(*tasks)
 
